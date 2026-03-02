@@ -39,8 +39,8 @@ AGENTS.md/CLAUDE.md contain project conventions. Root-level contents included be
 </customization>
 {{if .Codebase.InjectFiles}}
 <guidance>
-{{range .Codebase.InjectFiles}}<root_guidance file="{{.}}">
-{{index $.Codebase.InjectFileContents .}}
+{{range .Codebase.InjectFiles}}<root_guidance file="{{.Path}}"{{if .ImportedBy}} imported_by="{{.ImportedBy}}"{{end}}>
+{{.Content}}
 </root_guidance>
 {{end}}</guidance>
 {{end}}

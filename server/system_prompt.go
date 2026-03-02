@@ -199,13 +199,122 @@ func collectGitInfo(dir string) (*GitInfo, error) {
 	}, nil
 }
 
+// atFileRe matches @path tokens preceded by whitespace, an opening delimiter, or
+// start-of-line. This excludes email addresses (e.g. user@host has no leading
+// whitespace before the @). Square bracket [ is intentionally excluded: [@file](url)
+// is a Markdown hyperlink and should not be treated as a file reference.
+var atFileRe = regexp.MustCompile(`(?:^|[\s({<])@(\S+)`)
+
+// stripInlineCode replaces the contents of backtick spans with spaces so that
+// @refs inside inline code are not extracted. An unclosed span extends to end of line.
+func stripInlineCode(line string) string {
+	var b strings.Builder
+	inCode := false
+	for i := 0; i < len(line); i++ {
+		if line[i] == '`' {
+			inCode = !inCode
+			b.WriteByte(' ')
+		} else if inCode {
+			b.WriteByte(' ')
+		} else {
+			b.WriteByte(line[i])
+		}
+	}
+	return b.String()
+}
+
+// resolveAtPath resolves a raw @-reference token to an absolute path.
+// Returns "" if the token is not a recognisable path form (e.g. starts with @ or #).
+func resolveAtPath(raw, fromFile string) string {
+	switch {
+	case strings.HasPrefix(raw, "~/"):
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		return filepath.Clean(filepath.Join(home, raw[2:]))
+	case filepath.IsAbs(raw):
+		return filepath.Clean(raw)
+	case len(raw) > 0 && isAtPathStart(raw[0]):
+		return filepath.Clean(filepath.Join(filepath.Dir(fromFile), raw))
+	default:
+		return ""
+	}
+}
+
+// isAtPathStart returns true for characters that may begin a valid path token:
+// word characters, dot (for ./rel and bare names), slash, or tilde.
+func isAtPathStart(c byte) bool {
+	return c == '.' || c == '/' || c == '~' ||
+		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '_' || c == '-'
+}
+
+// atPathsInContent extracts the absolute paths of all @file references in content.
+// It skips fenced code blocks (``` or ~~~) and inline backtick spans so that @refs
+// inside code are not followed. fromFile is the absolute path of the containing file
+// and is used to resolve relative references.
+func atPathsInContent(content, fromFile string) []string {
+	var paths []string
+	inFence := false
+	for _, line := range strings.Split(content, "\n") {
+		// Track fenced code block boundaries (``` or ~~~).
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		for _, m := range atFileRe.FindAllStringSubmatch(stripInlineCode(line), -1) {
+			raw := m[1]
+			// Strip trailing punctuation unlikely to be part of a filename.
+			raw = strings.TrimRight(raw, ".,):!?")
+			// Strip URL-style fragment suffix.
+			if i := strings.Index(raw, "#"); i != -1 {
+				raw = raw[:i]
+			}
+			if p := resolveAtPath(raw, fromFile); p != "" {
+				paths = append(paths, p)
+			}
+		}
+	}
+	return paths
+}
+
+// addGuidanceFile loads the file at path into info if it has not been seen before,
+// then follows any @file references in its content. seen (keyed on lowercased path,
+// matching the existing convention in collectCodebaseInfo) prevents loading the same
+// file twice and is the sole cycle-detection mechanism — no depth limit is needed.
+func addGuidanceFile(path string, info *CodebaseInfo, seen map[string]bool) {
+	key := strings.ToLower(path)
+	if seen[key] {
+		return
+	}
+	content, err := os.ReadFile(path)
+	// Mark seen immediately after reading, even if content is empty, so repeated
+	// references to the same missing or empty file do not cause redundant reads.
+	seen[key] = true
+	if err != nil || len(content) == 0 {
+		return
+	}
+	info.InjectFiles = append(info.InjectFiles, path)
+	info.InjectFileContents[path] = string(content)
+	// Follow @file references found in this file. The shared seen map ensures
+	// that cycles (e.g. a child referencing its parent) terminate naturally.
+	for _, ref := range atPathsInContent(string(content), path) {
+		addGuidanceFile(ref, info, seen)
+	}
+}
+
 func collectCodebaseInfo(wd string, gitInfo *GitInfo) (*CodebaseInfo, error) {
 	info := &CodebaseInfo{
 		InjectFiles:        []string{},
 		InjectFileContents: make(map[string]string),
 	}
 
-	// Track seen files to avoid duplicates on case-insensitive file systems
+	// Track seen files to avoid duplicates on case-insensitive file systems.
+	// The same map is reused for @file reference expansion in addGuidanceFile.
 	seenFiles := make(map[string]bool)
 
 	// Check for user-level agent instructions in ~/.config/AGENTS.md, ~/.config/shelley/AGENTS.md, and ~/.shelley/AGENTS.md
@@ -216,15 +325,7 @@ func collectCodebaseInfo(wd string, gitInfo *GitInfo) (*CodebaseInfo, error) {
 			filepath.Join(home, ".shelley", "AGENTS.md"),
 		}
 		for _, f := range userAgentsFiles {
-			lowerPath := strings.ToLower(f)
-			if seenFiles[lowerPath] {
-				continue
-			}
-			if content, err := os.ReadFile(f); err == nil && len(content) > 0 {
-				info.InjectFiles = append(info.InjectFiles, f)
-				info.InjectFileContents[f] = string(content)
-				seenFiles[lowerPath] = true
-			}
+			addGuidanceFile(f, info, seenFiles)
 		}
 	}
 
@@ -235,36 +336,14 @@ func collectCodebaseInfo(wd string, gitInfo *GitInfo) (*CodebaseInfo, error) {
 	}
 
 	// Find root-level guidance files (case-insensitive)
-	rootGuidanceFiles := findGuidanceFilesInDir(searchRoot)
-	for _, file := range rootGuidanceFiles {
-		lowerPath := strings.ToLower(file)
-		if seenFiles[lowerPath] {
-			continue
-		}
-		seenFiles[lowerPath] = true
-
-		content, err := os.ReadFile(file)
-		if err == nil && len(content) > 0 {
-			info.InjectFiles = append(info.InjectFiles, file)
-			info.InjectFileContents[file] = string(content)
-		}
+	for _, file := range findGuidanceFilesInDir(searchRoot) {
+		addGuidanceFile(file, info, seenFiles)
 	}
 
 	// If working directory is different from root, also check working directory
 	if wd != searchRoot {
-		wdGuidanceFiles := findGuidanceFilesInDir(wd)
-		for _, file := range wdGuidanceFiles {
-			lowerPath := strings.ToLower(file)
-			if seenFiles[lowerPath] {
-				continue
-			}
-			seenFiles[lowerPath] = true
-
-			content, err := os.ReadFile(file)
-			if err == nil && len(content) > 0 {
-				info.InjectFiles = append(info.InjectFiles, file)
-				info.InjectFileContents[file] = string(content)
-			}
+		for _, file := range findGuidanceFilesInDir(wd) {
+			addGuidanceFile(file, info, seenFiles)
 		}
 	}
 
